@@ -4,6 +4,7 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "genesis.h"
+#include "ctrl_v2.h"
 #include "segacd.h"
 #include "blastem.h"
 #include "nor.h"
@@ -11,6 +12,10 @@
 #include <ctype.h>
 #include <time.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 #include "render.h"
 #include "gst.h"
 #include "util.h"
@@ -648,6 +653,7 @@ static m68k_context *sync_components(m68k_context * context, uint32_t address)
 			gen->last_flush_cycle -= deduction;
 			gen->last_sync_cycle -= deduction;
 		}
+		ctrl_v2_frame_boundary();
 		if (gen->header.frame_advance) {
 			gen->header.frame_advance = 0;
 			gen->header.paused = 1;
@@ -2235,6 +2241,42 @@ static void request_exit(system_header *system)
 	gen->m68k->should_return = 1;
 }
 
+int genesis_flush_sram(genesis_context *gen)
+{
+#ifdef _WIN32
+	return -2;
+#else
+	if (!gen->save_storage || !gen->save_size || gen->expansion || gen->mars ||
+	    (gen->save_type != RAM_FLAG_ODD && gen->save_type != RAM_FLAG_EVEN && gen->save_type != RAM_FLAG_BOTH)) return -2;
+	char *tmp = alloc_concat(save_filename, ".tmp.XXXXXX");
+	int fd = mkstemp(tmp);
+	if (fd < 0) { free(tmp); return -1; }
+	uint8_t *copy = malloc(gen->save_size);
+	if (!copy) { close(fd); unlink(tmp); free(tmp); return -1; }
+	memcpy(copy, gen->save_storage, gen->save_size);
+	if (gen->save_type == RAM_FLAG_BOTH) byteswap_rom(gen->save_size, (uint16_t *)copy);
+	size_t offset = 0;
+	int failed = 0;
+	while (offset < gen->save_size) {
+		ssize_t n = write(fd, copy + offset, gen->save_size - offset);
+		if (n <= 0) { failed = 1; break; }
+		offset += n;
+	}
+	free(copy);
+	if (fsync(fd)) failed = 1;
+	if (close(fd)) failed = 1;
+	if (!failed && rename(tmp, save_filename)) failed = 1;
+	if (!failed) {
+		int directory = open(gen->header.save_dir, O_RDONLY | O_DIRECTORY);
+		if (directory < 0) failed = 1;
+		else { if (fsync(directory)) failed = 1; close(directory); }
+	}
+	if (failed) unlink(tmp);
+	free(tmp);
+	return failed ? -1 : 0;
+#endif
+}
+
 static void persist_save(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
@@ -2264,6 +2306,14 @@ static void persist_save(system_header *system)
 	if (gen->save_type == SAVE_NONE) {
 		return;
 	}
+    if (!gen->expansion && !gen->mars &&
+        (gen->save_type == RAM_FLAG_ODD || gen->save_type == RAM_FLAG_EVEN || gen->save_type == RAM_FLAG_BOTH)) {
+        int result = genesis_flush_sram(gen);
+        if (result != -2) {
+            if (result) warning("Failed to persist SRAM atomically\n");
+            return;
+        }
+    }
 	f = fopen(save_filename, "wb");
 	if (!f) {
 		fprintf(stderr, "Failed to open %s file %s for writing\n", save_type_name(gen->save_type), save_filename);

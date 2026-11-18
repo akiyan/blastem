@@ -38,6 +38,8 @@ void render_pause_source(audio_source *src);
 void render_resume_source(audio_source *src);
 void render_free_source(audio_source *src);
 void render_end_audio(void);
+int render_capture_begin(const char *path, uint32_t seconds, uint32_t *rate);
+int render_capture_end(uint64_t *samples, uint32_t *rate, uint8_t *limited);
 void render_save_audio(char *path);
 //interface for render backends
 void render_audio_initialized(render_audio_format format, uint32_t rate, uint8_t channels, uint32_t buffer_size, int sample_size);

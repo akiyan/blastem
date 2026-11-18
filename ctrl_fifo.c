@@ -20,6 +20,8 @@
 #include <string.h>
 
 #include "ctrl_fifo.h"
+#include "ctrl_v2.h"
+#include <ctype.h>
 #include "net.h"
 #include "blastem.h"
 #include "system.h"
@@ -263,61 +265,76 @@ static void ctrl_sock_init(void)
 	debug_message("ctrl_sock: listening on %s\n", path);
 }
 
+static char input[65537];
+static size_t buffered;
+static char *response;
+static size_t sent;
+static int mode; /* 0 undecided, 1 legacy, 2 JSONL */
+
+static void close_client(void)
+{
+    socket_close(client_fd);
+    client_fd = -1;
+    buffered = 0;
+    free(response);
+    response = NULL;
+    sent = 0;
+    mode = 0;
+    ctrl_v2_reset();
+}
+
 void ctrl_fifo_poll(void)
 {
-	static uint8_t initialized;
-	static char buf[256];
-	static size_t buffered;
-	if (!initialized) {
-		initialized = 1;
-		ctrl_sock_init();
-	}
-	if (listen_fd < 0) {
-		return;
-	}
-	// Serve one client at a time (the harness connects, sends a few lines, disconnects).
-	if (client_fd < 0) {
-		int c = accept(listen_fd, NULL, NULL);
-		if (c < 0) {
-			return; // no pending connection this frame (or would-block)
-		}
-		socket_blocking(c, 0);
-		client_fd = c;
-		buffered = 0;
-	}
-	for (;;)
-	{
-		// recv works on a socket fd on both POSIX and Windows (unlike read on Windows)
-		int bytes = (int)recv(client_fd, buf + buffered, sizeof(buf) - 1 - buffered, 0);
-		if (bytes > 0) {
-			buffered += bytes;
-			buf[buffered] = 0;
-			char *start = buf, *newline;
-			while ((newline = strchr(start, '\n')))
-			{
-				*newline = 0;
-				process_command(start);
-				start = newline + 1;
-			}
-			buffered -= start - buf;
-			if (buffered >= sizeof(buf) - 1) {
-				// overlong line with no newline, discard it
-				buffered = 0;
-			}
-			memmove(buf, start, buffered);
-		} else if (bytes == 0) {
-			// client closed the connection; go back to accepting
-			socket_close(client_fd);
-			client_fd = -1;
-			break;
-		} else {
-			if (socket_error_is_wouldblock()) {
-				break; // no more data right now, try again next frame
-			}
-			// real error: drop the client
-			socket_close(client_fd);
-			client_fd = -1;
-			break;
-		}
-	}
+    static uint8_t initialized;
+    if (!initialized) {
+        initialized = 1;
+        ctrl_sock_init();
+    }
+    if (listen_fd < 0) return;
+    if (client_fd < 0) {
+        int c = accept(listen_fd, NULL, NULL);
+        if (c < 0) return;
+        socket_blocking(c, 0);
+        client_fd = c;
+    }
+    /* Bounded work per event poll; partial writes never block emulation. */
+    for (int work = 0; work < 8; work++) {
+        if (!response && mode == 2) response = ctrl_v2_take_response();
+        if (response) {
+#ifdef MSG_NOSIGNAL
+            int flags = MSG_NOSIGNAL;
+#else
+            int flags = 0;
+#endif
+            int n = send(client_fd, response + sent, strlen(response) - sent, flags);
+            if (n < 0 && socket_error_is_wouldblock()) return;
+            if (n <= 0) { close_client(); return; }
+            sent += n;
+            if (response[sent]) return;
+            free(response);
+            response = NULL;
+            sent = 0;
+            if (ctrl_v2_disconnect) { close_client(); return; }
+        }
+        char *newline = memchr(input, '\n', buffered);
+        if (newline) {
+            size_t length = newline - input;
+            input[length] = 0;
+            if (!mode) {
+                size_t first = 0;
+                while (first < length && isspace((unsigned char)input[first])) first++;
+                if (first < length) mode = input[first] == '{' ? 2 : 1;
+            }
+            if (mode == 2) response = ctrl_v2_command(input, length);
+            else if (mode == 1) process_command(input);
+            buffered -= length + 1;
+            memmove(input, newline + 1, buffered);
+            continue;
+        }
+        if (buffered == sizeof(input) - 1) { close_client(); return; }
+        int n = recv(client_fd, input + buffered, sizeof(input) - 1 - buffered, 0);
+        if (n > 0) buffered += n;
+        else if (n < 0 && socket_error_is_wouldblock()) return;
+        else { close_client(); return; }
+    }
 }

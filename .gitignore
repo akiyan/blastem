@@ -51,3 +51,7 @@ android/local.properties
 # macOS
 .DS_Store
 *~
+
+# akiyan: regression output of tools/akiyan-check.sh
+/.akiyan-check/
+__pycache__/
