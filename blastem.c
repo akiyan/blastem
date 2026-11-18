@@ -13,10 +13,12 @@
 #endif
 
 #include "system.h"
+#include "ctrl_v2.h"
 #include "68kinst.h"
 #include "mem.h"
 #include "vdp.h"
 #include "render.h"
+#include "sound_trace.h"
 #include "genesis.h"
 #include "gdb_remote.h"
 #include "gst.h"
@@ -85,6 +87,13 @@ void update_title(char *rom_name)
 
 static char *get_save_dir(system_media *media)
 {
+	const char *override = getenv("BLASTEM_SAVE_DIR");
+	if (override && *override) {
+		if (!is_absolute_path((char *)override) || !ensure_dir_exists(override)) {
+			fatal_error("BLASTEM_SAVE_DIR must be an accessible absolute directory\n");
+		}
+		return strdup(override);
+	}
 	char *savedir_template = tern_find_path(config, "ui\0save_path\0", TVAL_PTR).ptrval;
 	if (!savedir_template) {
 		savedir_template = "$USERDATA/blastem/$ROMNAME";
@@ -428,7 +437,41 @@ int main(int argc, char ** argv)
 	uint8_t fullscreen = FULLSCREEN_DEFAULT, use_gl = 1;
 	uint8_t debug_target = 0;
 	char *port;
+	uint8_t record_input_requested = 0;
 	for (int i = 1; i < argc; i++) {
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+		if (!strcmp(argv[i], "--record-input")) {
+			if (++i >= argc) fatal_error("--record-input requires a path\n");
+			record_input_requested = 1;
+			render_offline_inputs(argv[i]);
+			continue;
+		}
+		if (!strcmp(argv[i], "--record-mute")) {
+			if (++i >= argc || !sound_parse_channels(argv[i], &sound_mute_mask)) fatal_error("--record-mute requires channels: fm1-fm6, dac, psg1-psg3, noise, or the groups fm and psg\n");
+			record_input_requested = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "--record-no-video")) {
+			render_offline_no_video();
+			record_input_requested = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "--record-sound-log")) {
+			render_offline_sound_log();
+			record_input_requested = 1;
+			continue;
+		}
+		if (!strcmp(argv[i], "--record")) {
+			if (i + 2 >= argc) fatal_error("--record requires PREFIX FRAMES\n");
+			char *end;
+			unsigned long frames = strtoul(argv[i+2], &end, 10);
+			if (*end || !frames || frames > 10000000) fatal_error("Invalid recording frame count\n");
+			render_offline_configure(argv[i+1], frames);
+			register_log_handler(NULL);
+			i += 2;
+			continue;
+		}
+#endif
 		if (argv[i][0] == '-') {
 			switch(argv[i][1]) {
 			case 'b':
@@ -551,6 +594,13 @@ int main(int argc, char ** argv)
 				info_message(
 					"Usage: blastem [OPTIONS] ROMFILE [WIDTH] [HEIGHT]\n"
 					"Options:\n"
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+					"  --record PREFIX FRAMES  Headless APNG + WAV capture at nominal speed\n"
+					"  --record-input FILE     Sorted frame-indexed controller events\n"
+					"  --record-mute LIST      Mute channels (fm1-fm6,dac,psg1-psg3,noise,fm,psg)\n"
+					"  --record-no-video       Write audio and metadata only\n"
+					"  --record-sound-log      Write YM2612/PSG register writes to PREFIX.sound.jsonl\n"
+#endif
 					"	-h          Print this help text\n"
 					"	-r (J|U|E)  Force region to Japan, US or Europe respectively\n"
 					"	-m MACHINE  Force emulated machine type to MACHINE. Valid values are:\n"
@@ -623,6 +673,12 @@ int main(int argc, char ** argv)
 	config = tern_insert_path(config, "ui\0initial_path\0", (tern_val){.ptrval = strdup("/roms")}, TVAL_PTR);
 	setup_main_loop();
 #endif
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+	if (record_input_requested && !render_offline_active()) fatal_error("--record-input, --record-mute, --record-no-video and --record-sound-log require --record\n");
+	if (render_offline_active() && (headless || reader_addr || !loaded)) {
+		fatal_error("--record requires a ROM and cannot be combined with -b or an event reader\n");
+	}
+#endif
 	if (!headless) {
 		if (reader_addr) {
 			render_set_external_sync(1);
@@ -634,7 +690,7 @@ int main(int argc, char ** argv)
 	menu = !loaded;
 
 #ifndef DISABLE_NUKLEAR
-	use_nuklear = !headless && is_nuklear_available();
+	use_nuklear = !headless && !render_offline_active() && is_nuklear_available();
 #endif
 	if (!loaded && !use_nuklear) {
 		//load menu
@@ -681,6 +737,9 @@ int main(int argc, char ** argv)
 			fatal_error("Failed to detect system type for %s\n", romfname);
 		}
 
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+		if (render_offline_active() && stype != SYSTEM_GENESIS) fatal_error("Offline recording currently supports standalone Mega Drive cartridges\n");
+#endif
 		current_system = alloc_config_system(stype, &cart, menu ? 0 : opts, force_region);
 		if (!current_system) {
 			fatal_error("Failed to configure emulated machine for %s\n", romfname);
@@ -730,6 +789,7 @@ int main(int argc, char ** argv)
 		}
 		uint8_t was_paused = current_system->paused;
 		while (current_system->paused) {
+			ctrl_v2_safe_stop(1);
 			uint32_t start = render_elapsed_ms();
 			process_events();
 			render_update_display();
@@ -744,6 +804,7 @@ int main(int argc, char ** argv)
 				render_sleep_ms(1000/60 - duration);
 			}
 		}
+		ctrl_v2_safe_stop(0);
 		if (current_system->next_rom) {
 			char *next_rom = current_system->next_rom;
 			current_system->next_rom = NULL;

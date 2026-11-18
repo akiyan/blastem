@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "render_audio.h"
+#include "render.h"
 #include "util.h"
 #include "config.h"
 #include "blastem.h"
@@ -46,6 +47,46 @@ void render_save_audio(char *path)
 	free(path);
 }
 
+/* Bounded capture of the host mixer output, not an emulated-frame audio log. */
+static FILE *capture_file;
+static uint64_t capture_samples, capture_limit;
+static uint32_t capture_rate;
+static int capture_failed;
+
+int render_capture_begin(const char *path, uint32_t seconds, uint32_t *rate)
+{
+	if (render_is_threaded_video() || output_channels != 2 || !sample_rate) return -2;
+	render_lock_audio();
+	if (capture_file) { render_unlock_audio(); return -3; }
+	FILE *file = fopen(path, "wb");
+	if (!file) { render_unlock_audio(); return -1; }
+	if (!wave_init(file, sample_rate, 16, 2)) {
+		fclose(file); render_unlock_audio(); return -1;
+	}
+	capture_file = file;
+	capture_samples = 0;
+	capture_limit = (uint64_t)seconds * sample_rate * 2;
+	capture_rate = sample_rate;
+	capture_failed = 0;
+	*rate = sample_rate;
+	render_unlock_audio();
+	return 0;
+}
+
+int render_capture_end(uint64_t *samples, uint32_t *rate, uint8_t *limited)
+{
+	render_lock_audio();
+	if (!capture_file) { render_unlock_audio(); return -3; }
+	*samples = capture_samples / 2;
+	*rate = capture_rate;
+	*limited = capture_samples >= capture_limit;
+	int ok = wave_finalize(capture_file);
+	capture_file = NULL;
+	int failed = capture_failed || !ok;
+	render_unlock_audio();
+	return failed ? -1 : 0;
+}
+
 typedef void (*conv_func)(float *samples, void *vstream, int sample_count);
 
 static void convert_null(float *samples, void *vstream, int sample_count)
@@ -72,6 +113,13 @@ static void convert_s16(float *samples, void *vstream, int sample_count)
 	if (wav_file) {
 		fwrite(vstream, sizeof(int16_t), sample_count, wav_file);
 	}
+	if (capture_file && !capture_failed) {
+		size_t count = sample_count;
+		if (count > capture_limit - capture_samples) count = capture_limit - capture_samples;
+		size_t written = fwrite(vstream, sizeof(int16_t), count, capture_file);
+		capture_samples += written;
+		if (written != count) capture_failed = 1;
+	}
 }
 
 static int16_t *wave_buffer;
@@ -89,12 +137,11 @@ static void clamp_f32(float *samples, void *vstream, int sample_count)
 		}
 		*samples = sample;
 	}
-	if (wav_file) {
-		if (!wave_buffer) {
-			wave_buffer = calloc(sample_count, sizeof(int16_t));
-			wave_buffer_samples = sample_count;
-		} else if (sample_count < wave_buffer_samples) {
-			wave_buffer = realloc(wave_buffer, sizeof(int16_t) * sample_count);
+	if (wav_file || capture_file) {
+		if (sample_count > wave_buffer_samples) {
+			int16_t *buffer = realloc(wave_buffer, sizeof(int16_t) * sample_count);
+			if (!buffer) { capture_failed = 1; return; }
+			wave_buffer = buffer;
 			wave_buffer_samples = sample_count;
 		}
 		convert_s16(start, wave_buffer, sample_count);

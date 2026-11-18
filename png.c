@@ -117,7 +117,7 @@ void save_png24_frame(FILE *f, pixel_t *buffer, apng_state *apng, uint32_t width
 	}
 	uint8_t *compressed = malloc(compress_buffer_size);
 	compress_buffer_size -= offset;
-	compress(compressed + offset, &compress_buffer_size, idat_buffer, idat_size);
+	compress2(compressed + offset, &compress_buffer_size, idat_buffer, idat_size, apng ? apng->compression_level : Z_DEFAULT_COMPRESSION);
 	free(idat_buffer);
 	if (offset) {
 		cur = compressed;
@@ -135,6 +135,7 @@ apng_state* start_apng(FILE *f, uint32_t width, uint32_t height, float frame_rat
 {
 	write_header(f, width, height, COLOR_TRUE);
 	apng_state *apng = calloc(1, sizeof(apng_state));
+	apng->compression_level = Z_DEFAULT_COMPRESSION;
 	uint8_t chunk[] = {
 		0, 0, 0, 0,
 		0, 0, 0, 1
@@ -146,17 +147,21 @@ apng_state* start_apng(FILE *f, uint32_t width, uint32_t height, float frame_rat
 	return apng;
 }
 
-void end_apng(FILE *f, apng_state *apng)
+int end_apng(FILE *f, apng_state *apng)
 {
 	write_chunk(f, iend, NULL, 0);
-	fseek(f, apng->num_frame_offset, SEEK_SET);
+	int failed = ferror(f);
+	failed |= fseek(f, apng->num_frame_offset - 8, SEEK_SET) != 0;
 	uint8_t bytes[] = {
 		apng->num_frames >> 24, apng->num_frames >> 16, 
-		apng->num_frames >> 8, apng->num_frames
+		apng->num_frames >> 8, apng->num_frames, 0, 0, 0, 1
 	};
-	fwrite(bytes, 1, sizeof(bytes), f);
-	fclose(f);
+	/* Rewriting acTL data also requires rewriting its CRC. */
+	write_chunk(f, actl, bytes, sizeof(bytes));
+	failed |= ferror(f);
+	failed |= fclose(f) != 0;
 	free(apng);
+	return !failed;
 }
 
 void save_png24(FILE *f, pixel_t *buffer, uint32_t width, uint32_t height, uint32_t pitch)

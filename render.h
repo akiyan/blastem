@@ -106,6 +106,9 @@ typedef int (*render_thread_fun)(void*);
 pixel_t render_map_color(uint8_t r, uint8_t g, uint8_t b);
 void render_save_screenshot(char *path);
 void render_save_screenshot_burst(char *prefix, uint32_t count);
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+int render_snapshot(const char *path, uint32_t *width, uint32_t *height, uint64_t *sequence);
+#endif
 uint8_t render_saving_video(void);
 void render_end_video(void);
 void render_save_video(char *path);
@@ -172,5 +175,12 @@ void render_fill_rect(uint8_t window, uint8_t r, uint8_t g, uint8_t b, int x, in
 void render_window_refresh(uint8_t window);
 #endif
 
-#endif //RENDER_H_
+#if !defined(USE_FBDEV) && !defined(IS_LIB)
+void render_offline_inputs(const char *path);
+void render_offline_no_video(void);
+void render_offline_sound_log(void);
+void render_offline_configure(const char *prefix, uint32_t frames);
+uint8_t render_offline_active(void);
+#endif
 
+#endif //RENDER_H_

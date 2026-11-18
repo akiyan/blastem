@@ -19,12 +19,16 @@ int gdb_sock;
 #define GDB_READ read
 #define GDB_WRITE write
 #include <unistd.h>
+#include <sys/select.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #endif
 
 #include "gdb_remote.h"
+#include "ctrl_fifo.h"
+#include "ctrl_v2.h"
 #include "68kinst.h"
 #include "debug.h"
 #include "util.h"
@@ -52,6 +56,28 @@ size_t bufsize;
 int cont = 0;
 int expect_break_response=0;
 uint32_t resume_pc;
+static int interrupt_requested;
+
+/* Called once per frame while the 68000 runs after a continue/step. A Ctrl-C
+ * (0x03) byte from the client stops the CPU at the next instruction and the
+ * stop is reported as SIGINT. Other bytes are left for the command loop. */
+void gdb_remote_poll_interrupt(system_header *system)
+{
+#ifndef _WIN32
+	if (!expect_break_response || interrupt_requested || !system) return;
+	fd_set readable;
+	FD_ZERO(&readable);
+	FD_SET(GDB_IN_FD, &readable);
+	struct timeval zero = {0, 0};
+	if (select(GDB_IN_FD + 1, &readable, NULL, NULL, &zero) <= 0) return;
+	char byte;
+	if (recv(GDB_IN_FD, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 1 && byte == 0x03) {
+		recv(GDB_IN_FD, &byte, 1, MSG_DONTWAIT);
+		interrupt_requested = 1;
+		system->enter_debugger = 1;
+	}
+#endif
+}
 
 
 void hex_32(uint32_t num, char * out)
@@ -500,6 +526,23 @@ not_impl:
 	fatal_error("Command %s is not implemented, exiting...\n", command);
 }
 
+static int control_aware_read(void *dst, size_t size)
+{
+#ifndef _WIN32
+    for (;;) {
+        ctrl_fifo_poll();
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(GDB_IN_FD, &ready);
+        struct timeval delay = {0, 10000};
+        int n = select(GDB_IN_FD + 1, &ready, NULL, NULL, &delay);
+        if (n > 0) break;
+        if (n < 0 && errno != EINTR) return -1;
+    }
+#endif
+    return GDB_READ(GDB_IN_FD, dst, size);
+}
+
 void  gdb_debug_enter(void *vcontext, uint32_t pc)
 {
 	m68k_context *context = vcontext;
@@ -511,9 +554,10 @@ void  gdb_debug_enter(void *vcontext, uint32_t pc)
 			snprintf(reply, sizeof(reply), "T05watch:%X;", context->wp_hit_address);
 			gdb_send_command(reply);
 		} else {
-			gdb_send_command("S05");
+			gdb_send_command(interrupt_requested ? "S02" : "S05");
 		}
 		expect_break_response = 0;
+		interrupt_requested = 0;
 	}
 	debug_root *root = find_root(context);
 	if (!root) {
@@ -539,11 +583,12 @@ void  gdb_debug_enter(void *vcontext, uint32_t pc)
 	}
 	resume_pc = pc;
 	cont = 0;
+	ctrl_v2_debug_stopped = 1;
 	uint8_t partial = 0;
 	while(!cont)
 	{
 		if (!curbuf) {
-			int numread = GDB_READ(GDB_IN_FD, buf, bufsize);
+			int numread = control_aware_read(buf, bufsize);
 			if (numread < 0) {
 				fatal_error("Failed to read on GDB input file descriptor\n");
 			}
@@ -555,7 +600,7 @@ void  gdb_debug_enter(void *vcontext, uint32_t pc)
 				memmove(curbuf, buf, end-curbuf);
 				end -= curbuf - buf;
 			}
-			int numread = GDB_READ(GDB_IN_FD, end, bufsize - (end-buf));
+			int numread = control_aware_read(end, bufsize - (end-buf));
 			end += numread;
 			curbuf = buf;
 		}
@@ -594,6 +639,7 @@ void  gdb_debug_enter(void *vcontext, uint32_t pc)
 			curbuf = NULL;
 		}
 	}
+	ctrl_v2_debug_stopped = 0;
 }
 
 void gdb_remote_init(void)

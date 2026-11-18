@@ -4,6 +4,7 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "psg.h"
+#include "sound_trace.h"
 #include "blastem.h"
 #include "event_log.h"
 #include <string.h>
@@ -55,6 +56,7 @@ void psg_write(psg_context * context, uint8_t value)
 		vgm_sn76489_write(context->vgm, context->cycles, value);
 	}
 	event_log(EVENT_PSG_REG, context->cycles, sizeof(value), &value);
+	sound_trace_psg(value, context->cycles);
 	if (value & 0x80) {
 		context->latch = value & 0x70;
 		uint8_t channel = value >> 5 & 0x3;
@@ -135,7 +137,7 @@ void psg_run(psg_context * context, uint32_t cycles)
 
 		int16_t value;
 		for (int i = 0; i < 3; i++) {
-			if (context->output_state[i]) {
+			if (context->output_state[i] && !(sound_mute_mask & (1 << (SOUND_PSG1 + i)))) {
 				value = volume_table[context->volume[i]];
 				if (context->pan & pan_left) {
 					left_accum += value;
@@ -155,7 +157,7 @@ void psg_run(psg_context * context, uint32_t cycles)
 #endif
 		}
 		value = 0;
-		if (context->noise_out) {
+		if (context->noise_out && !(sound_mute_mask & (1 << SOUND_NOISE))) {
 			value = volume_table[context->volume[3]];
 			if (context->pan & pan_left) {
 				left_accum += value;

@@ -265,7 +265,7 @@ else
 Z80OBJS=z80inst.o z80_to_x86.o
 M68KOBJS+= m68k_core.o m68k_core_x86.o
 endif
-AUDIOOBJS=ym2612.o ymf262.o ym_common.o psg.o wave.o flac.o vgm.o event_log.o render_audio.o rf5c164.o
+AUDIOOBJS=ym2612.o ymf262.o ym_common.o psg.o sound_trace.o wave.o flac.o vgm.o event_log.o render_audio.o rf5c164.o
 CONFIGOBJS=config.o tern.o util.o paths.o
 # Embed the UI font (Inter Medium, SIL OFL) on all native targets instead of scanning the
 # system fonts at startup: fast, deterministic across macOS/Linux/Windows, and never fails.
@@ -313,7 +313,7 @@ CFLAGS+= -DZSTD_DISABLE_ASM=1
 endif
 endif
 
-COREOBJS:=system.o genesis.o vdp.o io.o romdb.o hash.o xband.o realtec.o i2c.o nor.o kit_prof.o kit_script.o $(M68KOBJS) \
+COREOBJS:=system.o genesis.o vdp.o vdp_trace.o io.o romdb.o hash.o xband.o realtec.o i2c.o nor.o kit_prof.o kit_script.o $(M68KOBJS) \
 	sega_mapper.o multi_game.o megawifi.o $(NET) serialize.o $(TERMINAL) $(CONFIGOBJS) gst.o \
 	$(TRANSOBJS) $(AUDIOOBJS) saves.o jcart.o gen_player.o coleco.o pico_pcm.o ymz263b.o \
 	segacd.o lc8951.o cdimage.o cdd_mcu.o cd_graphics.o cdd_fader.o sft_mapper.o mediaplayer.o \
@@ -326,7 +326,7 @@ else
 COREOBJS+= sms.o i8255.o korean_sms_multi.o $(Z80OBJS)
 endif
 
-MAINOBJS:=$(COREOBJS) blastem.o $(RENDEROBJS) zip.o  menu.o debug.o gdb_remote.o bindings.o ctrl_fifo.o oscilloscope.o
+MAINOBJS:=$(COREOBJS) blastem.o $(RENDEROBJS) zip.o  menu.o debug.o gdb_remote.o bindings.o ctrl_fifo.o ctrl_v2.o ctrl_state.o third_party/yyjson/yyjson.o oscilloscope.o
 
 LIBOBJS:=$(COREOBJS) libblastem.o rom.db.o $(LIBZOBJS)
 
@@ -496,6 +496,7 @@ $(OBJDIR)/%.o : %.S | $(ORDERONLY)
 	$(CC) -c -MMD -o $@ $<
 
 $(OBJDIR)/%.o : %.c | $(ORDERONLY)
+	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -MMD -o $@ $<
 
 $(OBJDIR)/%.o : %.m | $(ORDERONLY)

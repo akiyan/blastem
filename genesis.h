@@ -108,6 +108,7 @@ void genesis_serialize(genesis_context *gen, serialize_buffer *buf, uint32_t m68
 void genesis_deserialize(deserialize_buffer *buf, genesis_context *gen);
 void gen_update_refresh_free_access(m68k_context *context);
 void gen_update_z80_bank_pointer(genesis_context *gen);
+/* 0: durable atomic SRAM write; -1: IO error; -2: unsupported save device. */
+int genesis_flush_sram(genesis_context *gen);
 
 #endif //GENESIS_H_
-

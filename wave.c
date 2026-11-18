@@ -25,7 +25,7 @@ int wave_init(FILE * f, uint32_t sample_rate, uint16_t bits_per_sample, uint16_t
 	header.bits_per_sample = bits_per_sample;
 	memcpy(header.data_header.id, "data", 4);
 	header.data_header.size = 0;//This will be filled in later;
-	return fwrite(&header, 1, sizeof(header) - sizeof(header.data_offset), f) == sizeof(header);
+	return fwrite(&header, 1, sizeof(header) - sizeof(header.data_offset), f) == sizeof(header) - sizeof(header.data_offset);
 }
 
 uint8_t wave_read_header(FILE *f, wave_header *header)
@@ -65,19 +65,14 @@ uint8_t wave_read_header(FILE *f, wave_header *header)
 
 int wave_finalize(FILE * f)
 {
-	uint32_t size = ftell(f);
-	fseek(f, offsetof(wave_header, chunk.size), SEEK_SET);
-	size -= 8;
-	if (fwrite(&size, sizeof(size), 1, f) != 1) {
-		fclose(f);
-		return 0;
-	}
-	fseek(f, offsetof(wave_header, data_header.size), SEEK_SET);
-	size -= 36;
-	if (fwrite(&size, sizeof(size), 1, f) != 1) {
-		fclose(f);
-		return 0;
-	}
-	fclose(f);
-	return 1;
+	long end = ftell(f);
+	int ok = !ferror(f) && end >= 44 && (uint64_t)end <= UINT32_MAX;
+	uint32_t size = ok ? end - 8 : 0;
+	if (ok && fseek(f, offsetof(wave_header, chunk.size), SEEK_SET)) ok = 0;
+	if (ok && fwrite(&size, sizeof(size), 1, f) != 1) ok = 0;
+	size = ok ? end - 44 : 0;
+	if (ok && fseek(f, offsetof(wave_header, data_header.size), SEEK_SET)) ok = 0;
+	if (ok && fwrite(&size, sizeof(size), 1, f) != 1) ok = 0;
+	if (fclose(f)) ok = 0;
+	return ok;
 }

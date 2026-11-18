@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ym2612.h"
+#include "sound_trace.h"
 #include "render.h"
 #include "wave.h"
 #include "blastem.h"
@@ -476,6 +477,9 @@ void ym_output_sample(ym2612_context *context)
 			scope_add_sample(context->scope, context->channels[i].scope_channel, value, context->channels[i].phase_overflow);
 		}
 #endif
+		if (sound_mute_mask && (sound_mute_mask & (1 << ((i == 5 && context->dac_enable) ? SOUND_DAC : i)))) {
+			continue;
+		}
 		if (context->channels[i].lr & 0x80) {
 			left += (value * context->volume_mult) / context->volume_div;
 		} else if (context->zero_offset) {
@@ -701,6 +705,7 @@ void ym_data_write(ym2612_context * context, uint8_t value)
 		}
 		context->part1_regs[context->selected_reg - YM_PART1_START] = value;
 	}
+	sound_trace_ym(context->selected_part, context->selected_reg, value, context->current_cycle);
 	uint8_t buffer[3] = {context->selected_part, context->selected_reg, value};
 	event_log(EVENT_YM_REG, context->current_cycle, sizeof(buffer), buffer);
 	dfprintf(debug_file, "write of %X to reg %X in part %d\n", value, context->selected_reg, context->selected_part+1);

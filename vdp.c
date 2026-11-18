@@ -4,6 +4,7 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "vdp.h"
+#include "vdp_trace.h"
 #include "blastem.h"
 #include <stdlib.h>
 #include <string.h>
@@ -441,6 +442,7 @@ static void write_cram(vdp_context * context, uint16_t address, uint16_t value)
 		value = (value << 1 & 0xE) | (value << 2 & 0xE0) | (value & 0xE00);
 	}
 	write_cram_internal(context, addr, value);
+	vdp_trace_write(context, VDP_TRACE_CRAM, addr * 2, value);
 
 	if (context->output && context->hslot >= BG_START_SLOT && (
 		context->vcounter < context->inactive_start + context->border_bot
@@ -1243,6 +1245,7 @@ static void external_slot(vdp_context * context)
 				}
 				uint8_t buffer[3] = {((start->address/2) & 63) + 128, context->vsram[(start->address/2) & 63] >> 8, context->vsram[(start->address/2) & 63]};
 				event_log(EVENT_VDP_INTRAM, context->cycles, sizeof(buffer), buffer);
+				vdp_trace_write(context, VDP_TRACE_VSRAM, ((start->address/2) & 63) * 2, context->vsram[(start->address/2) & 63]);
 			}
 
 			break;
@@ -5864,6 +5867,7 @@ void vdp_reg_write(vdp_context *context, uint16_t reg, uint16_t value)
 		uint8_t buffer[2] = {reg, value};
 		event_log(EVENT_VDP_REG, context->cycles, sizeof(buffer), buffer);
 		context->regs[reg] = value;
+		vdp_trace_write(context, VDP_TRACE_REG, reg, context->regs[reg]);
 		if (reg == REG_MODE_1 || reg == REG_MODE_2 || reg == REG_MODE_4) {
 			update_video_params(context);
 		}

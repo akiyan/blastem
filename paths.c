@@ -554,6 +554,11 @@ char const *get_config_dir()
 {
 	static char* confdir;
 	if (!confdir) {
+		char const *xdg = getenv("XDG_CONFIG_HOME");
+		if (xdg && xdg[0] == '/') {
+			confdir = alloc_concat(xdg, PATH_SEP "blastem");
+			return confdir;
+		}
 		char const *base = get_home_dir();
 		if (base) {
 			confdir = alloc_concat(base, CONFIG_PREFIX PATH_SEP "blastem");
@@ -566,6 +571,11 @@ char const *get_userdata_dir()
 {
 	static char* savedir;
 	if (!savedir) {
+		char const *xdg = getenv("XDG_DATA_HOME");
+		if (xdg && xdg[0] == '/') {
+			savedir = strdup(xdg);
+			return savedir;
+		}
 		char const *base = get_home_dir();
 		if (base) {
 			savedir = alloc_concat(base, USERDATA_SUFFIX);

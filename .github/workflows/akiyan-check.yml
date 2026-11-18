@@ -1,0 +1,38 @@
+name: akiyan-check
+
+# Regression tests for the akiyan additions (control protocol v2, recording,
+# MCP server). Release builds remain in build.yml and run only on v* tags.
+
+on:
+  push:
+    branches: [akiyan]
+  pull_request:
+    branches: [akiyan]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.27.x"
+          cache-dependency-path: mcp/go.sum
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libsdl2-dev libglew-dev libgl-dev \
+            binutils-m68k-linux-gnu xvfb xauth ffmpeg
+      - name: Build and test
+        run: JOBS=4 tools/akiyan-check.sh "$RUNNER_TEMP/akiyan-check"
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: akiyan-check-logs
+          path: ${{ runner.temp }}/akiyan-check/*.log

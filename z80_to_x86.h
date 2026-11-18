@@ -106,6 +106,10 @@ struct z80_context {
 	uint8_t           busack;
 	uint8_t           int_is_nmi;
 	uint8_t           im2_vector;
+	/* Cumulative master clocks spent executing, stopped by BUSREQ, and held in reset. */
+	uint64_t          stat_run_mclks;
+	uint64_t          stat_busack_mclks;
+	uint64_t          stat_reset_mclks;
 	uint8_t           ram_code_flags[];
 };
 

@@ -2586,6 +2586,15 @@ void m68k_breakpoint_patch(m68k_context *context, uint32_t address, debug_handle
 	call_noalign(&native, opts->bp_stub);
 }
 
+void m68k_emit_rte_hook(m68k_options *opts)
+{
+	code_info *code = &opts->gen.code;
+	call(code, opts->gen.save_context);
+	call_args_abi(code, (code_ptr)m68k_on_rte, 1, opts->gen.context_reg);
+	mov_rr(code, RAX, opts->gen.context_reg, SZ_PTR);
+	call(code, opts->gen.load_context);
+}
+
 void init_m68k_opts(m68k_options * opts, memmap_chunk * memmap, uint32_t num_chunks, uint32_t clock_divider, sync_fun sync_components, int_ack_fun int_ack)
 {
 	memset(opts, 0, sizeof(*opts));

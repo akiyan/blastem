@@ -4,6 +4,8 @@
  BlastEm is free software distributed under the terms of the GNU General Public License version 3 or greater. See COPYING for full license text.
 */
 #include "genesis.h"
+#include "vdp_trace.h"
+#include "ctrl_v2.h"
 #include "segacd.h"
 #include "blastem.h"
 #include "nor.h"
@@ -11,6 +13,10 @@
 #include <ctype.h>
 #include <time.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 #include "render.h"
 #include "gst.h"
 #include "util.h"
@@ -629,6 +635,7 @@ static m68k_context *sync_components(m68k_context * context, uint32_t address)
 			}
 			context->cycles -= deduction;
 			kit_prof_rebase(deduction);
+			vdp_trace_adjust(deduction);
 			z80_adjust_cycles(z_context, deduction);
 			ym_adjust_cycles(gen->ym, deduction);
 			if (gen->ym->vgm) {
@@ -648,6 +655,7 @@ static m68k_context *sync_components(m68k_context * context, uint32_t address)
 			gen->last_flush_cycle -= deduction;
 			gen->last_sync_cycle -= deduction;
 		}
+		ctrl_v2_frame_boundary();
 		if (gen->header.frame_advance) {
 			gen->header.frame_advance = 0;
 			gen->header.paused = 1;
@@ -904,6 +912,7 @@ static m68k_context* sync_components_pico(m68k_context * context, uint32_t addre
 			}
 			context->cycles -= deduction;
 			kit_prof_rebase(deduction);
+			vdp_trace_adjust(deduction);
 			if (gen->psg->vgm) {
 				vgm_adjust_cycles(gen->psg->vgm, deduction);
 			}
@@ -985,6 +994,16 @@ static m68k_context* sync_components_pico(m68k_context * context, uint32_t addre
 	return context;
 }
 
+static void rte_observer(m68k_context *context)
+{
+	/* Main 68000 only; the Sega CD sub CPU shares the translator. */
+	if (!vdp_trace_file || context->system != (void *)current_system) return;
+	genesis_context *gen = context->system;
+	if (context != gen->m68k) return;
+	vdp_run_context(gen->vdp, context->cycles);
+	vdp_trace_rte(gen->vdp, context->cycles);
+}
+
 static m68k_context *int_ack(m68k_context *context)
 {
 	genesis_context * gen = context->system;
@@ -993,6 +1012,7 @@ static m68k_context *int_ack(m68k_context *context)
 		//printf("acknowledging %d @ %d:%d, vcounter: %d, hslot: %d\n", context->int_ack, context->cycles, v_context->cycles, v_context->vcounter, v_context->hslot);
 		vdp_run_context(v_context, context->cycles);
 		vdp_int_ack(v_context);
+		if (context == gen->m68k) vdp_trace_int(v_context, context->int_num, context->cycles);
 	}
 
 	//the Genesis responds to these exclusively with !VPA which means its a slow
@@ -2235,6 +2255,42 @@ static void request_exit(system_header *system)
 	gen->m68k->should_return = 1;
 }
 
+int genesis_flush_sram(genesis_context *gen)
+{
+#ifdef _WIN32
+	return -2;
+#else
+	if (!gen->save_storage || !gen->save_size || gen->expansion || gen->mars ||
+	    (gen->save_type != RAM_FLAG_ODD && gen->save_type != RAM_FLAG_EVEN && gen->save_type != RAM_FLAG_BOTH)) return -2;
+	char *tmp = alloc_concat(save_filename, ".tmp.XXXXXX");
+	int fd = mkstemp(tmp);
+	if (fd < 0) { free(tmp); return -1; }
+	uint8_t *copy = malloc(gen->save_size);
+	if (!copy) { close(fd); unlink(tmp); free(tmp); return -1; }
+	memcpy(copy, gen->save_storage, gen->save_size);
+	if (gen->save_type == RAM_FLAG_BOTH) byteswap_rom(gen->save_size, (uint16_t *)copy);
+	size_t offset = 0;
+	int failed = 0;
+	while (offset < gen->save_size) {
+		ssize_t n = write(fd, copy + offset, gen->save_size - offset);
+		if (n <= 0) { failed = 1; break; }
+		offset += n;
+	}
+	free(copy);
+	if (fsync(fd)) failed = 1;
+	if (close(fd)) failed = 1;
+	if (!failed && rename(tmp, save_filename)) failed = 1;
+	if (!failed) {
+		int directory = open(gen->header.save_dir, O_RDONLY | O_DIRECTORY);
+		if (directory < 0) failed = 1;
+		else { if (fsync(directory)) failed = 1; close(directory); }
+	}
+	if (failed) unlink(tmp);
+	free(tmp);
+	return failed ? -1 : 0;
+#endif
+}
+
 static void persist_save(system_header *system)
 {
 	genesis_context *gen = (genesis_context *)system;
@@ -2264,6 +2320,14 @@ static void persist_save(system_header *system)
 	if (gen->save_type == SAVE_NONE) {
 		return;
 	}
+    if (!gen->expansion && !gen->mars &&
+        (gen->save_type == RAM_FLAG_ODD || gen->save_type == RAM_FLAG_EVEN || gen->save_type == RAM_FLAG_BOTH)) {
+        int result = genesis_flush_sram(gen);
+        if (result != -2) {
+            if (result) warning("Failed to persist SRAM atomically\n");
+            return;
+        }
+    }
 	f = fopen(save_filename, "wb");
 	if (!f) {
 		fprintf(stderr, "Failed to open %s file %s for writing\n", save_type_name(gen->save_type), save_filename);
@@ -3182,6 +3246,7 @@ static genesis_context *shared_init_gen(rom_info info, void *lock_on, uint32_t l
 
 	m68k_options *opts = malloc(sizeof(m68k_options));
 	init_m68k_opts(opts, map, map_chunks, MCLKS_PER_68K, sync_components, int_ack);
+	m68k_rte_observer = rte_observer;
 	if (!strcmp(tern_find_ptr_default(model, "tas", "broken"), "broken")) {
 		opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
 	}
@@ -3281,6 +3346,7 @@ genesis_context *alloc_config_genesis_cdboot(system_media *media, uint32_t syste
 
 	m68k_options *opts = malloc(sizeof(m68k_options));
 	init_m68k_opts(opts, map, num_chunks, MCLKS_PER_68K, sync_components, int_ack);
+	m68k_rte_observer = rte_observer;
 	//TODO: make this configurable
 	opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
 	gen->m68k = init_68k_context(opts, NULL);
@@ -3346,6 +3412,7 @@ genesis_context *alloc_genesis_32x_cdboot(system_media *media, uint32_t system_o
 
 	m68k_options *opts = malloc(sizeof(m68k_options));
 	init_m68k_opts(opts, map, num_chunks, MCLKS_PER_68K, sync_components, int_ack);
+	m68k_rte_observer = rte_observer;
 	//TODO: make this configurable
 	opts->gen.flags |= M68K_OPT_BROKEN_READ_MODIFY;
 	gen->m68k = init_68k_context(opts, NULL);

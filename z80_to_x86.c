@@ -3456,9 +3456,17 @@ static void check_nmi(z80_context *context)
 void z80_run(z80_context * context, uint32_t target_cycle)
 {
 	if (context->reset || context->busack) {
+		if (target_cycle > context->current_cycle) {
+			if (context->reset) {
+				context->stat_reset_mclks += target_cycle - context->current_cycle;
+			} else {
+				context->stat_busack_mclks += target_cycle - context->current_cycle;
+			}
+		}
 		context->current_cycle = target_cycle;
 	} else {
 		if (context->current_cycle < target_cycle) {
+			uint32_t run_start = context->current_cycle;
 			//busreq is sampled at the end of an m-cycle
 			//we can approximate that by running for a single m-cycle after a bus request
 			context->sync_cycle = context->busreq ? context->current_cycle + 3*context->options->gen.clock_divider : target_cycle;
@@ -3483,8 +3491,12 @@ void z80_run(z80_context * context, uint32_t target_cycle)
 				context->options->run(context);
 				dprintf("Z80 ran to cycle %d\n", context->current_cycle);
 			}
+			context->stat_run_mclks += context->current_cycle - run_start;
 			if (context->busreq) {
 				context->busack = 1;
+				if (target_cycle > context->current_cycle) {
+					context->stat_busack_mclks += target_cycle - context->current_cycle;
+				}
 				context->current_cycle = target_cycle;
 			}
 		}

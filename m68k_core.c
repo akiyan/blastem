@@ -625,11 +625,22 @@ void swap_ssp_usp(m68k_options * opts)
 	native_to_areg(opts, opts->gen.scratch2, 8);
 }
 
+void (*m68k_rte_observer)(m68k_context *context);
+
+m68k_context *m68k_on_rte(m68k_context *context)
+{
+	if (m68k_rte_observer) {
+		m68k_rte_observer(context);
+	}
+	return context;
+}
+
 static void translate_m68k_rte(m68k_options *opts, m68kinst *inst)
 {
 	m68k_trap_if_not_supervisor(opts, inst);
 
 	code_info *code = &opts->gen.code;
+	m68k_emit_rte_hook(opts);
 	//Read saved SR
 	areg_to_native(opts, 7, opts->gen.scratch1);
 	call(code, opts->read_16);

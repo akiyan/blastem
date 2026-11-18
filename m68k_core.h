@@ -130,6 +130,9 @@ typedef m68k_context *(*m68k_reset_handler)(m68k_context *context);
 void translate_m68k_stream(uint32_t address, m68k_context * context);
 void start_68k_context(m68k_context * context, uint32_t address);
 void resume_68k(m68k_context *context);
+/* Optional observer called before every RTE executes (used by scanline tracing). */
+extern void (*m68k_rte_observer)(m68k_context *context);
+m68k_context *m68k_on_rte(m68k_context *context);
 void init_m68k_opts(m68k_options * opts, memmap_chunk * memmap, uint32_t num_chunks, uint32_t clock_divider, sync_fun sync_components, int_ack_fun int_ack);
 m68k_context * init_68k_context(m68k_options * opts, m68k_reset_handler reset_handler);
 void m68k_reset(m68k_context * context);

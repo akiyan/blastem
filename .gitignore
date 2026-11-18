@@ -51,3 +51,11 @@ android/local.properties
 # macOS
 .DS_Store
 *~
+
+# akiyan: English documentation for the akiyan additions (other *.md stay untracked)
+!/mcp/AGENT_GUIDE.md
+!/docs/*.md
+
+# akiyan: regression output of tools/akiyan-check.sh
+/.akiyan-check/
+__pycache__/

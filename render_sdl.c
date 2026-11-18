@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include "render.h"
+#include "sound_trace.h"
 #include "render_sdl.h"
 #include "blastem.h"
 #include "genesis.h"
@@ -18,6 +19,8 @@
 #include "paths.h"
 #include "ppm.h"
 #include "png.h"
+#include "wave.h"
+#include "io.h"
 #include "config.h"
 #include "controller_info.h"
 
@@ -96,6 +99,88 @@ enum {
 	SYNC_VIDEO,
 	SYNC_EXTERNAL
 };
+
+/* Offline capture keeps the nominal emulation clock. No SDL window or audio
+ * device is created; the producer drains complete mixer blocks itself. */
+static const char *offline_prefix;
+static uint32_t offline_limit, offline_frames, offline_width, offline_height;
+static uint64_t offline_samples;
+/* Even incompressible 320x256 RGB frames stay below 512 MiB per file. */
+#define OFFLINE_CHUNK_FRAMES 1800
+static uint32_t offline_chunks;
+static FILE *offline_video, *offline_audio;
+#ifndef DISABLE_ZLIB
+static apng_state *offline_apng;
+#endif
+static pixel_t offline_pixels[512 * 512];
+static int offline_finished;
+static int offline_no_video, offline_sound_log;
+/* Active display rectangle within the 320-wide recording, per run of frames. */
+typedef struct { uint32_t from, to, x, y, width, height; } offline_area;
+static offline_area *offline_areas;
+static uint32_t offline_area_count;
+
+void render_offline_no_video(void) { offline_no_video = 1; }
+void render_offline_sound_log(void) { offline_sound_log = 1; }
+static FILE *offline_meta;
+static pixel_t offline_output[320 * 256];
+typedef struct { uint32_t frame; uint8_t pad, button, down; } offline_input;
+static offline_input *offline_events;
+static uint32_t offline_event_count, offline_event_cursor;
+void render_offline_inputs(const char *path)
+{
+	if (offline_events) fatal_error("Only one recording input file is allowed\n");
+	FILE *f = fopen(path, "r");
+	if (!f) fatal_error("Cannot read recording inputs %s\n", path);
+	char line[256], action[16], button[16], extra;
+	const char *names[] = {"", "up", "down", "left", "right", "a", "b", "c", "start", "x", "y", "z", "mode"};
+	unsigned frame, pad;
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == '#' || line[0] == '\n') continue;
+		if (sscanf(line, "%u %u %15s %15s %c", &frame, &pad, action, button, &extra) != 4 ||
+			frame == 0 || pad < 1 || pad > 8 ||
+			(strcmp(action, "down") && strcmp(action, "up")) ||
+			(offline_event_count && frame < offline_events[offline_event_count-1].frame)) {
+			fatal_error("Invalid recording input (expected sorted: FRAME PAD down|up BUTTON; frames start at 1)\n");
+		}
+		unsigned b;
+		for (b = 1; b < sizeof(names)/sizeof(*names); b++) if (!strcmp(button, names[b])) break;
+		if (b == sizeof(names)/sizeof(*names)) fatal_error("Unknown recording button %s\n", button);
+		offline_events = realloc(offline_events, sizeof(*offline_events) * (offline_event_count+1));
+		if (!offline_events) fatal_error("Cannot allocate recording inputs\n");
+		offline_events[offline_event_count++] = (offline_input){frame, pad, b, !strcmp(action, "down")};
+	}
+	if (ferror(f)) fatal_error("Cannot read recording input file\n");
+	fclose(f);
+}
+static void offline_apply_inputs(uint32_t frame)
+{
+	while (offline_event_cursor < offline_event_count && offline_events[offline_event_cursor].frame <= frame) {
+		offline_input *e = offline_events + offline_event_cursor++;
+		system_u8_u8_fun action = e->down ? current_system->gamepad_down : current_system->gamepad_up;
+		if (!action) fatal_error("This system does not support recording pad inputs\n");
+		action(current_system, e->pad, e->button);
+	}
+}
+uint8_t render_offline_active(void) { return offline_prefix != NULL; }
+void render_offline_configure(const char *prefix, uint32_t frames)
+{
+#ifdef DISABLE_ZLIB
+	fatal_error("Offline recording requires zlib\n");
+#endif
+	offline_prefix = prefix;
+	offline_limit = frames;
+}
+static FILE *offline_open(const char *suffix)
+{
+	char *path = malloc(strlen(offline_prefix) + strlen(suffix) + 1);
+	sprintf(path, "%s%s", offline_prefix, suffix);
+	FILE *f = fopen(path, "wbx");
+	if (!f) fatal_error("Cannot create recording output %s (existing files are not overwritten)\n", path);
+	free(path);
+	return f;
+}
+static void offline_finish(void);
 
 static uint8_t sync_src;
 static uint32_t min_buffered;
@@ -229,6 +314,7 @@ void render_free_audio_opaque(void *opaque)
 
 void render_audio_created(audio_source *source)
 {
+	if (offline_prefix) return;
 	audio_active = 1;
 	if (sync_src == SYNC_AUDIO) {
 		//SDL_PauseAudio acquires the audio device lock, which is held while the callback runs
@@ -260,6 +346,7 @@ void render_source_paused(audio_source *src, uint8_t remaining_sources)
 
 void render_source_resumed(audio_source *src)
 {
+	if (offline_prefix) return;
 	audio_active = 1;
 	if (sync_src == SYNC_AUDIO) {
 		//SDL_PauseAudio acquires the audio device lock, which is held while the callback runs
@@ -285,6 +372,21 @@ void render_set_audio_full_fun(ui_render_fun cb)
 
 void render_do_audio_ready(audio_source *src)
 {
+	if (offline_prefix) {
+		if (src->front_populated) fatal_error("Offline audio producer overrun\n");
+		int16_t *tmp = src->front;
+		src->front = src->back;
+		src->back = tmp;
+		src->front_populated = 1;
+		src->buffer_pos = 0;
+		if (all_sources_ready()) {
+			uint8_t pcm[1024 * 4];
+			mix_and_convert(pcm, sizeof(pcm), NULL);
+			if (fwrite(pcm, 1, sizeof(pcm), offline_audio) != sizeof(pcm)) fatal_error("Offline audio write failed\n");
+			offline_samples += 1024;
+		}
+		return;
+	}
 	if (sync_src == SYNC_AUDIO_THREAD) {
 		int16_t *tmp = src->front;
 		src->front = src->back;
@@ -1422,6 +1524,15 @@ static void window_setup(void)
 	}
 #endif
 	main_window = SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, main_width, main_height, flags);
+#ifndef DISABLE_OPENGL
+	if (!main_window && gl_enabled) {
+		/* Video drivers without OpenGL (e.g. SDL_VIDEODRIVER=dummy for headless runs) */
+		warning("Unable to create an OpenGL window (%s), falling back to SDL2 renderer\n", SDL_GetError());
+		gl_enabled = 0;
+		flags &= ~SDL_WINDOW_OPENGL;
+		main_window = SDL_CreateWindow(caption, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, main_width, main_height, flags);
+	}
+#endif
 	if (!main_window) {
 		fatal_error("Unable to create SDL window: %s\n", SDL_GetError());
 	}
@@ -1457,6 +1568,10 @@ static void window_setup(void)
 			flags |= SDL_RENDERER_PRESENTVSYNC;
 		}
 		main_renderer = SDL_CreateRenderer(main_window, -1, flags);
+		if (!main_renderer) {
+			warning("Unable to create an accelerated SDL renderer (%s), using software\n", SDL_GetError());
+			main_renderer = SDL_CreateRenderer(main_window, -1, SDL_RENDERER_SOFTWARE);
+		}
 
 		if (!main_renderer) {
 			fatal_error("unable to create SDL renderer: %s\n", SDL_GetError());
@@ -1487,6 +1602,28 @@ static void window_setup(void)
 
 void render_init(int width, int height, char * title, uint8_t fullscreen)
 {
+	if (offline_prefix) {
+		if (offline_event_count && offline_events[offline_event_count-1].frame >= offline_limit) fatal_error("Recording input is outside frame limit\n");
+		if (SDL_Init(0)) fatal_error("Cannot initialize SDL\n");
+		atexit(SDL_Quit);
+		sync_src = SYNC_AUDIO;
+		audio_mutex = SDL_CreateMutex();
+		audio_ready = SDL_CreateCond();
+		main_width = 320;
+		main_height = 240;
+		sample_rate = 44100;
+		render_audio_initialized(RENDER_AUDIO_S16, 44100, 2, 1024, 2);
+		if (!offline_no_video) {
+			offline_video = offline_open(".apng");
+			offline_chunks = 1;
+		}
+		offline_audio = offline_open(".wav");
+		if (offline_sound_log) sound_log = offline_open(".sound.jsonl");
+		offline_meta = offline_open(".json");
+		if (!wave_init(offline_audio, 44100, 16, 2)) fatal_error("Cannot write WAV header\n");
+		atexit(offline_finish);
+		return;
+	}
 #ifdef SDL_HINT_WINDOWS_DPI_SCALING
 	//In some ways, the other DPI scaling option for SDL2 on Windows is better for BlastEm's needs,
 	//but setting this makes it more consistent with how high DPI support works on other platforms
@@ -2194,6 +2331,10 @@ pixel_t *locked_pixels;
 uint32_t locked_pitch;
 pixel_t *render_get_framebuffer(uint8_t which, int *pitch)
 {
+	if (offline_prefix) {
+		*pitch = PITCH_BYTES(LINEBUF_SIZE);
+		return offline_pixels;
+	}
 	if (sync_src == SYNC_AUDIO_THREAD || sync_src == SYNC_EXTERNAL) {
 		*pitch = PITCH_BYTES(LINEBUF_SIZE);
 		pixel_t *buffer;
@@ -2274,6 +2415,51 @@ uint8_t events_processed;
 
 static uint32_t last_width, last_height;
 static uint8_t interlaced, last_field;
+/* Owned copy of the last completed progressive frame. Never reads a live VDP
+ * buffer while the CPU is stopped halfway through the next frame. */
+static pixel_t snapshot_pixels[512 * 512];
+static uint32_t snapshot_width, snapshot_height;
+static uint64_t snapshot_sequence;
+static system_header *snapshot_system;
+
+static void cache_completed_frame(pixel_t *pixels, uint32_t width, uint32_t height, uint32_t pitch, uint8_t which)
+{
+	if (sync_src == SYNC_AUDIO_THREAD || sync_src == SYNC_EXTERNAL) return;
+	if (which != FRAMEBUFFER_ODD || interlaced || width > 512 || height > 512 || !pixels) {
+		snapshot_width = 0;
+		return;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		memcpy(snapshot_pixels + y * width, (uint8_t *)pixels + y * pitch, width * sizeof(pixel_t));
+	}
+	snapshot_width = width;
+	snapshot_height = height;
+	snapshot_system = current_system;
+	snapshot_sequence++;
+}
+
+int render_snapshot(const char *path, uint32_t *width, uint32_t *height, uint64_t *sequence)
+{
+	if (sync_src == SYNC_AUDIO_THREAD || sync_src == SYNC_EXTERNAL) return -2;
+	if (!snapshot_width || snapshot_system != current_system) return -3;
+	FILE *file = fopen(path, "wb");
+	if (!file) return -1;
+#ifndef DISABLE_ZLIB
+	save_png(file, snapshot_pixels, snapshot_width, snapshot_height, snapshot_width * sizeof(pixel_t));
+#else
+	fclose(file);
+	remove(path);
+	return -2;
+#endif
+	int failed = ferror(file);
+	if (fclose(file)) failed = 1;
+	if (failed) { remove(path); return -1; }
+	*width = snapshot_width;
+	*height = snapshot_height;
+	*sequence = snapshot_sequence;
+	return 0;
+}
+
 static void process_framebuffer(pixel_t *buffer, uint8_t which, int width)
 {
 	if (vsync_enabled && which <= FRAMEBUFFER_EVEN && source_frame_count < 0) {
@@ -2321,6 +2507,7 @@ static void process_framebuffer(pixel_t *buffer, uint8_t which, int width)
 	}
 #ifndef DISABLE_OPENGL
 	if (render_gl && which <= FRAMEBUFFER_EVEN) {
+		cache_completed_frame(buffer, width, height, PITCH_BYTES(LINEBUF_SIZE), which);
 		SDL_GL_MakeCurrent(main_window, main_context);
 		glBindTexture(GL_TEXTURE_2D, textures[which]);
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LINEBUF_SIZE, height, SRC_FORMAT, SRC_TYPE, buffer);
@@ -2391,6 +2578,9 @@ static void process_framebuffer(pixel_t *buffer, uint8_t which, int width)
 #ifndef DISABLE_ZLIB
 			}
 #endif
+		}
+		if (which <= FRAMEBUFFER_EVEN) {
+			cache_completed_frame(locked_pixels + overscan_left[video_standard] + (locked_pitch / sizeof(pixel_t)) * overscan_top[video_standard], width, shot_height, locked_pitch, which);
 		}
 		SDL_UnlockTexture(sdl_textures[which]);
 #ifndef DISABLE_OPENGL
@@ -2534,8 +2724,80 @@ typedef struct {
 frame frame_queue[4];
 int frame_queue_len, frame_queue_read, frame_queue_write;
 
+static void offline_note_area(uint32_t raw_width, uint32_t height)
+{
+	uint32_t frame = offline_frames + 1;
+	uint32_t active_width = raw_width - BORDER_LEFT - BORDER_RIGHT;
+	int32_t x = (int32_t)(320 - (raw_width - overscan_left[video_standard] - overscan_right[video_standard])) / 2
+		+ (int32_t)BORDER_LEFT - (int32_t)overscan_left[video_standard];
+	uint32_t y = 0, active_height = height;
+	if (current_system && current_system->type == SYSTEM_GENESIS) {
+		vdp_context *vdp = ((genesis_context *)current_system)->vdp;
+		y = vdp->border_top;
+		active_height = (vdp->regs[REG_MODE_2] & BIT_PAL) ? 240 : 224;
+	}
+	if (x < 0) { active_width += x; x = 0; }
+	if (x + active_width > 320) active_width = 320 - x;
+	if (y + active_height > height) active_height = height > y ? height - y : 0;
+	offline_area *last = offline_area_count ? offline_areas + offline_area_count - 1 : NULL;
+	if (last && last->x == (uint32_t)x && last->y == y && last->width == active_width && last->height == active_height) {
+		last->to = frame;
+		return;
+	}
+	offline_areas = realloc(offline_areas, sizeof(*offline_areas) * (offline_area_count + 1));
+	if (!offline_areas) fatal_error("Cannot record display areas\n");
+	offline_areas[offline_area_count++] = (offline_area){frame, frame, x, y, active_width, active_height};
+}
+
 void render_framebuffer_updated(uint8_t which, int width)
 {
+	if (offline_prefix && which <= FRAMEBUFFER_EVEN) {
+#ifndef DISABLE_ZLIB
+		if (which != FRAMEBUFFER_ODD) fatal_error("Offline recording currently requires progressive video\n");
+		uint32_t height = (video_standard == VID_PAL ? 294 : 243) - overscan_top[video_standard] - overscan_bot[video_standard];
+		width -= overscan_left[video_standard] + overscan_right[video_standard];
+		if (width < 1 || width > 320 || height > 256 || (offline_frames && offline_height != height)) {
+			fatal_error("Unsupported video mode during offline recording\n");
+		}
+		offline_note_area(width + overscan_left[video_standard] + overscan_right[video_standard], height);
+		if (offline_no_video) {
+			offline_width = 320;
+			offline_height = height;
+			goto offline_frame_done;
+		}
+		offline_width = 320;
+		offline_height = height;
+		memset(offline_output, 0, sizeof(offline_output));
+		for (uint32_t y = 0; y < height; y++) {
+			memcpy(offline_output + y * 320 + (320-width)/2,
+				offline_pixels + (y + overscan_top[video_standard]) * PITCH_PIXEL_T(LINEBUF_SIZE) + overscan_left[video_standard], width * sizeof(pixel_t));
+		}
+		if (offline_apng && offline_frames % OFFLINE_CHUNK_FRAMES == 0) {
+			int failed = ferror(offline_video);
+			failed |= !end_apng(offline_video, offline_apng);
+			offline_apng = NULL;
+			offline_video = NULL;
+			if (failed) fatal_error("Cannot finalize recording video chunk\n");
+			char suffix[32];
+			snprintf(suffix, sizeof(suffix), ".part%04u.apng", offline_chunks);
+			offline_video = offline_open(suffix);
+			offline_chunks++;
+		}
+		if (!offline_apng) {
+			offline_apng = start_apng(offline_video, 320, height,
+			video_standard == VID_PAL ? 53203395.0 / (3420 * 313) : 53693175.0 / (3420 * 262));
+			offline_apng->compression_level = 1; /* Favor capture throughput. */
+		}
+		save_png24_frame(offline_video, offline_output, offline_apng, 320, height, 320 * sizeof(pixel_t));
+		if (ferror(offline_video)) fatal_error("Offline video write failed\n");
+offline_frame_done:
+		offline_frames++;
+		sound_trace_frame_done(offline_frames);
+		if (offline_frames == offline_limit) exit(0);
+		offline_apply_inputs(offline_frames);
+#endif
+		return;
+	}
 	if (which < FRAMEBUFFER_USER_START && (sync_src == SYNC_AUDIO_THREAD || sync_src == SYNC_EXTERNAL)) {
 		SDL_LockMutex(frame_mutex);
 			while (frame_queue_len == 4) {
@@ -2974,4 +3236,40 @@ char *render_read_clipboard(void)
 	char *ret = strdup(tmp);
 	SDL_free(tmp);
 	return ret;
+}
+
+static void offline_finish(void)
+{
+	if (offline_finished) return;
+	offline_finished = 1;
+	int failed = 0;
+#ifndef DISABLE_ZLIB
+	if (offline_apng) {
+		failed |= ferror(offline_video) || fflush(offline_video);
+		failed |= !end_apng(offline_video, offline_apng);
+	} else if (offline_video) fclose(offline_video);
+#endif
+	if (offline_audio) failed |= !wave_finalize(offline_audio);
+	failed |= sound_trace_close();
+	char muted[160];
+	sound_mute_names(muted, sizeof(muted));
+	FILE *meta = offline_meta;
+	char areas[4096];
+	size_t used = 0;
+	areas[0] = 0;
+	for (uint32_t i = 0; i < offline_area_count && used < sizeof(areas) - 96; i++) {
+		offline_area *a = offline_areas + i;
+		used += snprintf(areas + used, sizeof(areas) - used, "%s{\"from\":%u,\"to\":%u,\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u}",
+			i ? "," : "", a->from, a->to, a->x, a->y, a->width, a->height);
+	}
+	if (offline_area_count && used >= sizeof(areas) - 96) failed = 1; /* too many mode changes to describe */
+	fprintf(meta, "{\"active_areas\":[%s],\"frames\":%u,\"width\":%u,\"height\":%u,\"fps_num\":%u,\"fps_den\":%u,\"audio_samples\":%llu,\"sample_rate\":44100,\"video_chunk_frames\":%u,\"video_chunks\":%u,\"video\":%s,\"muted\":[%s],\"sound_log\":%s,\"complete\":%s}\n",
+		areas, offline_frames, offline_width, offline_height,
+		video_standard == VID_PAL ? 53203395 : 53693175,
+		3420 * (video_standard == VID_PAL ? 313 : 262),
+		(unsigned long long)offline_samples, OFFLINE_CHUNK_FRAMES, offline_chunks, offline_no_video ? "false" : "true", muted,
+		offline_sound_log ? "true" : "false", !failed && offline_frames == offline_limit ? "true" : "false");
+	failed |= ferror(meta);
+	failed |= fclose(meta) != 0;
+	if (failed) { fputs("Failed to finalize offline recording\n", stderr); _Exit(1); }
 }
